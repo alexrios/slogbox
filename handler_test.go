@@ -315,6 +315,75 @@ func TestJSON_LogValuer(t *testing.T) {
 	}
 }
 
+func TestWithAttrs_LogValuerResolved(t *testing.T) {
+	// Handler-level attrs passed via WithAttrs must have LogValuers resolved
+	// eagerly, matching the resolution applied to record-level attrs in Handle.
+	h := New(10, nil)
+	child := h.WithAttrs([]slog.Attr{slog.Any("token", tokenValue{raw: "secret"})})
+	logger := slog.New(child)
+	logger.Info("request")
+
+	data, err := h.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error: %v", err)
+	}
+
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+	attrs, ok := entries[0]["attrs"].(map[string]any)
+	if !ok {
+		t.Fatalf("attrs not a map: %T", entries[0]["attrs"])
+	}
+	got, ok := attrs["token"].(string)
+	if !ok {
+		t.Fatalf("token not a string: %T (%v)", attrs["token"], attrs["token"])
+	}
+	if got != "REDACTED:secret" {
+		t.Errorf("token = %q, want %q", got, "REDACTED:secret")
+	}
+}
+
+func TestWithAttrs_LogValuerResolvedInGroup(t *testing.T) {
+	// LogValuer resolution must also work for attrs nested under a group.
+	h := New(10, nil)
+	child := h.WithGroup("auth").WithAttrs([]slog.Attr{slog.Any("token", tokenValue{raw: "key123"})})
+	logger := slog.New(child)
+	logger.Info("request")
+
+	data, err := h.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error: %v", err)
+	}
+
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+	attrs, ok := entries[0]["attrs"].(map[string]any)
+	if !ok {
+		t.Fatalf("attrs not a map: %T", entries[0]["attrs"])
+	}
+	authGroup, ok := attrs["auth"].(map[string]any)
+	if !ok {
+		t.Fatalf("auth not a map: %T (%v)", attrs["auth"], attrs["auth"])
+	}
+	got, ok := authGroup["token"].(string)
+	if !ok {
+		t.Fatalf("auth.token not a string: %T (%v)", authGroup["token"], authGroup["token"])
+	}
+	if got != "REDACTED:key123" {
+		t.Errorf("auth.token = %q, want %q", got, "REDACTED:key123")
+	}
+}
+
 func TestConcurrency(t *testing.T) {
 	h := New(100, nil)
 	logger := slog.New(h)
@@ -322,26 +391,22 @@ func TestConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	// Writers.
 	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 100 {
 				logger.Info("concurrent", "t", time.Now().UnixNano())
 			}
-		}()
+		})
 	}
 	// Readers.
 	for range 5 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 50 {
 				_ = h.Records()
 				_ = h.Len()
 				for range h.All() {
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -395,11 +460,9 @@ func TestHandle_BufferSizeOne(t *testing.T) {
 }
 
 func TestWithAttrs_AfterConsumedGroup(t *testing.T) {
-	// After WithGroup("a").WithAttrs({x:1}), the pending group "a" is consumed
-	// (groupsUsed == len(groups)). A subsequent WithAttrs({y:2}) has no pending
-	// group so y is stored at the same level as Group("a"), not inside it.
-	// Record-level attrs still go inside Group("a") because Handle navigates
-	// through all groups when merging.
+	// After WithGroup("a").WithAttrs({x:1}).WithAttrs({y:2}), all handler-level
+	// attrs (x and y) must be scoped inside Group("a"), matching stdlib behaviour.
+	// Record-level attrs also belong inside Group("a").
 	h := New(10, nil)
 	ctx := t.Context()
 
@@ -424,22 +487,24 @@ func TestWithAttrs_AfterConsumedGroup(t *testing.T) {
 		return true
 	})
 
-	// y was added after the group was consumed: it sits at the top level.
-	if _, ok := top["y"]; !ok {
-		t.Error("y should be at top level (added after group 'a' was consumed)")
+	// y must be inside group "a", not at the top level.
+	if _, ok := top["y"]; ok {
+		t.Error("y must be inside group 'a', not at top level")
 	}
-	if _, ok := top["a"]; !ok {
+	aAttr, ok := top["a"]
+	if !ok {
 		t.Fatal("group 'a' missing")
 	}
 	aInner := map[string]string{}
-	for _, ga := range top["a"].(slog.Attr).Value.Group() {
+	for _, ga := range aAttr.(slog.Attr).Value.Group() {
 		aInner[ga.Key] = ga.Value.String()
 	}
-	// x was added while group "a" was pending: it is inside the group.
 	if aInner["x"] != "1" {
 		t.Errorf("a.x = %q, want \"1\"", aInner["x"])
 	}
-	// Record-level attrs go into the deepest active group.
+	if aInner["y"] != "2" {
+		t.Errorf("a.y = %q, want \"2\"", aInner["y"])
+	}
 	if aInner["z"] != "record" {
 		t.Errorf("a.z = %q, want \"record\"", aInner["z"])
 	}
@@ -542,6 +607,42 @@ func TestWithGroup_Nested(t *testing.T) {
 	}
 }
 
+func TestWithGroup_RecordAttrsRouted(t *testing.T) {
+	// Record-level attrs must be nested under an open (unconsumed) group,
+	// exercising the mergeGroupAttrs path in Handle (lines 128-135) for
+	// attrs that arrive via the record itself rather than WithAttrs.
+	h := New(10, nil)
+	child := h.WithGroup("req") // open group: no WithAttrs called after it
+	logger := slog.New(child)
+	logger.Info("hit", "method", "GET")
+
+	recs := h.Records()
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+
+	top := map[string]slog.Attr{}
+	recs[0].Attrs(func(a slog.Attr) bool {
+		top[a.Key] = a
+		return true
+	})
+
+	if _, ok := top["method"]; ok {
+		t.Error("method must be inside group 'req', not at top level")
+	}
+	reqAttr, ok := top["req"]
+	if !ok {
+		t.Fatal("group 'req' missing from record attrs")
+	}
+	inner := map[string]string{}
+	for _, ga := range reqAttr.Value.Group() {
+		inner[ga.Key] = ga.Value.String()
+	}
+	if inner["method"] != "GET" {
+		t.Errorf("req.method = %q, want \"GET\"", inner["method"])
+	}
+}
+
 func TestHandle_EmptyKeyAttrWithNonComparableValue(t *testing.T) {
 	// slog.Value.Equal panics on non-comparable types (slices, maps, functions)
 	// because it eventually calls v.Any() == w.Any() for KindAny values.
@@ -637,6 +738,38 @@ func TestJSON_NoAttrs(t *testing.T) {
 	}
 }
 
+func TestJSON_InlineGroup(t *testing.T) {
+	h := New(10, nil)
+	ctx := t.Context()
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(
+		slog.Group("", slog.String("c", "d")), // inline group: children go to top level
+		slog.String("keep", "yes"),
+	)
+	if err := h.Handle(ctx, r); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	data, err := h.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error: %v", err)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	attrs, ok := entries[0]["attrs"].(map[string]any)
+	if !ok {
+		t.Fatalf("attrs not a map: %T", entries[0]["attrs"])
+	}
+	if attrs["c"] != "d" {
+		t.Errorf("inline group child c = %v, want \"d\"", attrs["c"])
+	}
+	if attrs["keep"] != "yes" {
+		t.Errorf("attrs[keep] = %v, want \"yes\"", attrs["keep"])
+	}
+}
+
 func TestJSON_NestedGroups(t *testing.T) {
 	h := New(10, nil)
 	child := h.WithGroup("a").WithGroup("b").WithGroup("c").WithAttrs([]slog.Attr{slog.Int("depth", 3)})
@@ -698,7 +831,7 @@ func (ch *collectingHandler) len() int {
 func (ch *collectingHandler) records() []slog.Record {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	return append([]slog.Record(nil), ch.recs...)
+	return slices.Clone(ch.recs)
 }
 
 func (ch *collectingHandler) reset() {
@@ -910,13 +1043,11 @@ func TestFlush_Concurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 10 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 100 {
 				logger.Error("concurrent")
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -959,11 +1090,9 @@ func TestFlush_ClearDuringFlush(t *testing.T) {
 		logger.Info("before")
 	}
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		logger.Error("trigger")
-	}()
+	})
 
 	// Wait until the flush goroutine is inside flushTo.Handle, then Clear.
 	<-ready
@@ -1004,23 +1133,61 @@ func TestFlush_NoDuplicates(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			logger.Error("trigger")
-		}()
+		})
 	}
 	wg.Wait()
 
-	seen := map[string]int{}
+	// Check that no seed record appears more than once across all flush windows.
+	// Trigger records are excluded: two goroutines each deliver one per non-overlapping window.
+	seenSeed := map[string]int{}
 	for _, r := range collector.records() {
-		key := fmt.Sprintf("%s|%s", r.Message, r.Time.String())
-		seen[key]++
-	}
-	for key, n := range seen {
-		if n > 1 {
-			t.Errorf("record %q flushed %d times (want ≤1)", key, n)
+		if r.Message != "trigger" {
+			seenSeed[r.Message]++
 		}
+	}
+	for msg, n := range seenSeed {
+		if n > 1 {
+			t.Errorf("seed record %q flushed %d times (want ≤1)", msg, n)
+		}
+	}
+}
+
+func TestFlush_ErrorMidBatch(t *testing.T) {
+	// Verify at-most-once semantics when FlushTo errors mid-batch:
+	// records before the error are delivered, records after are permanently lost
+	// (they were already claimed under the lock).
+	errBoom := errors.New("boom")
+	inner := &collectingHandler{}
+	flushTo := &nthErrorHandler{n: 3, err: errBoom, wrapped: inner}
+
+	h := New(100, &Options{
+		Level:   slog.LevelInfo,
+		FlushOn: slog.LevelError,
+		FlushTo: flushTo,
+	})
+	logger := slog.New(h)
+
+	logger.Info("one")
+	logger.Info("two")
+	logger.Error("three") // triggers flush of [one, two, three]; errors on call 3 (three)
+
+	// Handle must return errBoom.
+	ctx := t.Context()
+	r := slog.NewRecord(time.Now(), slog.LevelError, "four", 0)
+	err := h.Handle(ctx, r) // triggers a new single-record flush; call 4 is not the error call
+	if err != nil {
+		t.Errorf("second Handle() unexpected error: %v", err)
+	}
+
+	// The first flush errored on record "three": one and two were delivered.
+	msgs := inner.messages()
+	if len(msgs) < 2 {
+		t.Fatalf("expected at least 2 delivered records before error, got %d: %v", len(msgs), msgs)
+	}
+	if msgs[0] != "one" || msgs[1] != "two" {
+		t.Errorf("delivered messages = %v, want [one two ...]", msgs)
 	}
 }
 
@@ -1209,6 +1376,29 @@ type errWriter struct{ err error }
 
 func (ew errWriter) Write([]byte) (int, error) { return 0, ew.err }
 
+// nthErrorHandler is a slog.Handler that returns an error on the Nth Handle call.
+// Calls before N are forwarded to wrapped; calls after N are silently dropped.
+type nthErrorHandler struct {
+	mu      sync.Mutex
+	n       int // error on this call (1-indexed)
+	calls   int
+	err     error
+	wrapped *collectingHandler
+}
+
+func (h *nthErrorHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *nthErrorHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.calls++
+	if h.calls == h.n {
+		return h.err
+	}
+	return h.wrapped.Handle(context.Background(), r)
+}
+func (h *nthErrorHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *nthErrorHandler) WithGroup(string) slog.Handler      { return h }
+
 func TestWriteTo_WriterError(t *testing.T) {
 	h := New(10, nil)
 	logger := slog.New(h)
@@ -1223,6 +1413,111 @@ func TestWriteTo_WriterError(t *testing.T) {
 
 // Verify Handler implements io.WriterTo.
 var _ io.WriterTo = (*Handler)(nil)
+
+// --- Internal unit tests (white-box) ---
+
+func TestSnapshotLast_Zero(t *testing.T) {
+	// snapshotLast(0) must return nil without panicking.
+	c := &recorder{
+		buf:   make([]slog.Record, 10),
+		count: 5,
+		head:  5,
+	}
+	got := c.snapshotLast(0)
+	if got != nil {
+		t.Errorf("snapshotLast(0) = %v, want nil", got)
+	}
+}
+
+func TestFilterByAge_BoundaryIncluded(t *testing.T) {
+	// A record timestamped exactly at now-maxAge sits at the cutoff.
+	// BinarySearchFunc finds the first record with time >= cutoff, so the
+	// boundary record must be included in the result.
+	now := time.Now()
+	maxAge := time.Minute
+	records := []slog.Record{
+		slog.NewRecord(now.Add(-time.Minute-time.Second), slog.LevelInfo, "too-old", 0),
+		slog.NewRecord(now.Add(-time.Minute), slog.LevelInfo, "boundary", 0),
+		slog.NewRecord(now.Add(-time.Second), slog.LevelInfo, "recent", 0),
+	}
+	got := filterByAge(records, maxAge, now)
+	if len(got) != 2 {
+		t.Fatalf("filterByAge returned %d records, want 2", len(got))
+	}
+	if got[0].Message != "boundary" {
+		t.Errorf("got[0].Message = %q, want \"boundary\"", got[0].Message)
+	}
+	if got[1].Message != "recent" {
+		t.Errorf("got[1].Message = %q, want \"recent\"", got[1].Message)
+	}
+}
+
+func TestCollectAttrs_EmptyInlineGroup(t *testing.T) {
+	// An empty inline group (key="", KindGroup, no children) passes Handle's
+	// filter but produces no map entries. collectAttrs must return nil so that
+	// the JSON output omits the "attrs" field entirely.
+	h := New(10, nil)
+	ctx := t.Context()
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "test", 0)
+	r.AddAttrs(slog.Group("")) // empty inline group
+	_ = h.Handle(ctx, r)
+
+	data, err := h.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error: %v", err)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+	if _, exists := entries[0]["attrs"]; exists {
+		t.Error("attrs should be omitted when the only attr is an empty inline group")
+	}
+}
+
+func TestAddAttrToMap_DeepInlineGroup(t *testing.T) {
+	// An inline group (key="", KindGroup) nested inside another inline group
+	// exercises the recursive path in addAttrToMap twice. Children at both
+	// levels must be merged into the same parent map.
+	h := New(10, nil)
+	ctx := t.Context()
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(
+		slog.Group("",
+			slog.Group("", slog.String("deep", "yes")), // nested inline group
+			slog.String("shallow", "also"),
+		),
+		slog.String("top", "level"),
+	)
+	if err := h.Handle(ctx, r); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	data, err := h.JSON()
+	if err != nil {
+		t.Fatalf("JSON() error: %v", err)
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal(data, &entries); err != nil {
+		t.Fatalf("Unmarshal error: %v", err)
+	}
+	attrs, ok := entries[0]["attrs"].(map[string]any)
+	if !ok {
+		t.Fatalf("attrs not a map: %T", entries[0]["attrs"])
+	}
+	if attrs["deep"] != "yes" {
+		t.Errorf("deep inline child: got %v, want \"yes\"", attrs["deep"])
+	}
+	if attrs["shallow"] != "also" {
+		t.Errorf("shallow inline child: got %v, want \"also\"", attrs["shallow"])
+	}
+	if attrs["top"] != "level" {
+		t.Errorf("top-level attr: got %v, want \"level\"", attrs["top"])
+	}
+}
 
 func TestHandler_Slogtest(t *testing.T) {
 	var h *Handler

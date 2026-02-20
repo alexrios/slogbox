@@ -10,27 +10,25 @@ import (
 
 func BenchmarkHandle(b *testing.B) {
 	h := New(1024, nil)
-	ctx := context.Background()
+	ctx := b.Context()
 	r := slog.NewRecord(time.Now(), slog.LevelInfo, "benchmark", 0)
 	r.AddAttrs(slog.String("key", "value"))
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = h.Handle(ctx, r)
 	}
 }
 
 func BenchmarkHandle_Parallel(b *testing.B) {
 	h := New(1024, nil)
-	ctx := context.Background()
+	ctx := b.Context()
 	r := slog.NewRecord(time.Now(), slog.LevelInfo, "benchmark", 0)
 	r.AddAttrs(slog.String("key", "value"))
 
 	b.ReportAllocs()
-	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
-		for pb.Next() {
+		for pb.Next() { // b.Loop() is not applicable inside RunParallel; pb.Next() is correct here
 			_ = h.Handle(ctx, r)
 		}
 	})
@@ -38,7 +36,7 @@ func BenchmarkHandle_Parallel(b *testing.B) {
 
 func BenchmarkRecords(b *testing.B) {
 	h := New(1000, nil)
-	ctx := context.Background()
+	ctx := b.Context()
 	for range 1000 {
 		r := slog.NewRecord(time.Now(), slog.LevelInfo, "fill", 0)
 		r.AddAttrs(slog.String("k", "v"))
@@ -46,15 +44,14 @@ func BenchmarkRecords(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = h.Records()
 	}
 }
 
 func BenchmarkAll(b *testing.B) {
 	h := New(1000, nil)
-	ctx := context.Background()
+	ctx := b.Context()
 	for range 1000 {
 		r := slog.NewRecord(time.Now(), slog.LevelInfo, "fill", 0)
 		r.AddAttrs(slog.String("k", "v"))
@@ -62,8 +59,7 @@ func BenchmarkAll(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		for range h.All() {
 		}
 	}
@@ -71,7 +67,7 @@ func BenchmarkAll(b *testing.B) {
 
 func BenchmarkJSON(b *testing.B) {
 	h := New(100, nil)
-	ctx := context.Background()
+	ctx := b.Context()
 	for range 100 {
 		r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
 		r.AddAttrs(
@@ -85,8 +81,7 @@ func BenchmarkJSON(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_, _ = h.JSON()
 	}
 }
@@ -102,8 +97,7 @@ func BenchmarkWithAttrs(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = h.WithAttrs(attrs)
 	}
 }
@@ -112,8 +106,7 @@ func BenchmarkWithGroup(b *testing.B) {
 	h := New(1024, nil)
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = h.WithGroup("request")
 	}
 }
@@ -132,13 +125,12 @@ func BenchmarkHandle_WithFlush(b *testing.B) {
 		FlushOn: slog.LevelError,
 		FlushTo: discardHandler{},
 	})
-	ctx := context.Background()
+	ctx := b.Context()
 	r := slog.NewRecord(time.Now(), slog.LevelInfo, "benchmark", 0)
 	r.AddAttrs(slog.String("key", "value"))
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = h.Handle(ctx, r)
 	}
 }
@@ -149,15 +141,14 @@ func BenchmarkHandle_FlushTrigger(b *testing.B) {
 		FlushOn: slog.LevelError,
 		FlushTo: discardHandler{},
 	})
-	ctx := context.Background()
+	ctx := b.Context()
 	info := slog.NewRecord(time.Now(), slog.LevelInfo, "fill", 0)
 	info.AddAttrs(slog.String("key", "value"))
 	errRec := slog.NewRecord(time.Now(), slog.LevelError, "boom", 0)
 	errRec.AddAttrs(slog.String("key", "value"))
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		// Write 99 INFO records then 1 ERROR to trigger flush of 100.
 		for range 99 {
 			_ = h.Handle(ctx, info)
@@ -168,7 +159,7 @@ func BenchmarkHandle_FlushTrigger(b *testing.B) {
 
 func BenchmarkWriteTo(b *testing.B) {
 	h := New(100, nil)
-	ctx := context.Background()
+	ctx := b.Context()
 	for range 100 {
 		r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
 		r.AddAttrs(
@@ -183,8 +174,7 @@ func BenchmarkWriteTo(b *testing.B) {
 
 	var buf bytes.Buffer
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		buf.Reset()
 		_, _ = h.WriteTo(&buf)
 	}
@@ -192,7 +182,7 @@ func BenchmarkWriteTo(b *testing.B) {
 
 func BenchmarkRecords_WithMaxAge(b *testing.B) {
 	h := New(1000, &Options{MaxAge: 5 * time.Minute})
-	ctx := context.Background()
+	ctx := b.Context()
 	now := time.Now()
 	for i := range 1000 {
 		r := slog.NewRecord(now.Add(-time.Duration(1000-i)*time.Second), slog.LevelInfo, "fill", 0)
@@ -201,8 +191,7 @@ func BenchmarkRecords_WithMaxAge(b *testing.B) {
 	}
 
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		_ = h.Records()
 	}
 }
