@@ -1,0 +1,19 @@
+[tools]
+go = "1.26"
+act = "latest"
+
+[tasks.test]
+run = "go test -v -race ./..."
+description = "Run all tests with race detector"
+
+[tasks.bench]
+run = "go test -bench=. -benchmem -count=10 ./..."
+description = "Run benchmarks"
+
+[tasks.lint]
+run = "go vet ./..."
+description = "Run go vet"
+
+[tasks.ci]
+run = "act -W .github/workflows/ci.yml"
+description = "Run CI workflow locally with act"

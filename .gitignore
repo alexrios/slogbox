@@ -1,0 +1,14 @@
+# Test binary, built with `go test -c`
+*.test
+
+# Output of `go cover`
+*.out
+
+# IDE directories
+.idea/
+.vscode/
+
+# AI Stuff
+.claude
+AGENTS.md
+CLAUDE.md
