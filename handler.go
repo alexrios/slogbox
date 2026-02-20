@@ -24,6 +24,9 @@ type Options struct {
 
 	// FlushOn sets the level threshold that triggers a flush of buffered records
 	// to FlushTo. Both FlushOn and FlushTo must be set for flush to be active.
+	// Flush errors are returned by Handle. Records are claimed before flushing
+	// begins: at-most-once delivery — a record is never re-sent even if
+	// FlushTo.Handle returns an error.
 	FlushOn slog.Leveler
 
 	// FlushTo is the destination handler for flushed records.
@@ -32,6 +35,7 @@ type Options struct {
 
 	// MaxAge excludes records older than this duration from read operations
 	// (Records, All, JSON, WriteTo). Zero means no age filtering.
+	// Negative values cause New to panic.
 	// Len returns the physical count regardless of MaxAge.
 	MaxAge time.Duration
 }
@@ -46,7 +50,7 @@ type recorder struct {
 
 	flushOn   slog.Leveler
 	flushTo   slog.Handler
-	lastFlush uint64 // value of total at the last flush
+	lastFlush uint64 // value of total claimed by the last flush; updated inside mu
 
 	maxAge time.Duration
 }
@@ -80,6 +84,9 @@ func New(size int, opts *Options) *Handler {
 			c.flushOn = opts.FlushOn
 			c.flushTo = opts.FlushTo
 		}
+		if opts.MaxAge < 0 {
+			panic("slogbox: MaxAge must be non-negative")
+		}
 		c.maxAge = opts.MaxAge
 	}
 	return &Handler{
@@ -90,9 +97,6 @@ func New(size int, opts *Options) *Handler {
 
 // Enabled reports whether the handler stores records at the given level.
 func (h *Handler) Enabled(_ context.Context, level slog.Level) bool {
-	if h.level == nil {
-		return level >= slog.LevelInfo
-	}
 	return level >= h.level.Level()
 }
 
@@ -103,12 +107,19 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 	// Build a new record merging handler-level and record-level attrs.
 	nr := slog.NewRecord(r.Time, r.Level, r.Message, r.PC)
 
-	// Collect record-level attrs, skipping empty attrs per slog.Handler contract.
+	// Collect record-level attrs per the slog.Handler contract:
+	//   - Skip attrs with an empty key unless they are inline groups
+	//     (empty key + KindGroup): those must be kept and their children
+	//     treated as if they were at the current level.
+	//   - Never call a.Equal(slog.Attr{}) for the check: Value.Equal uses ==
+	//     on interface values, which panics for non-comparable types such as
+	//     slices, maps, or functions stored via slog.Any.
 	var recordAttrs []slog.Attr
 	r.Attrs(func(a slog.Attr) bool {
-		if !a.Equal(slog.Attr{}) {
-			recordAttrs = append(recordAttrs, a)
+		if a.Key == "" && a.Value.Resolve().Kind() != slog.KindGroup {
+			return true // skip: empty-key non-group attr
 		}
+		recordAttrs = append(recordAttrs, a)
 		return true
 	})
 
@@ -137,25 +148,24 @@ func (h *Handler) Handle(_ context.Context, r slog.Record) error {
 			n = c.count
 		}
 		flushRecords = c.snapshotLast(n)
+		// Claim the window immediately under the lock so concurrent flushes
+		// compute non-overlapping ranges. At-most-once semantics: claimed
+		// records are not re-sent even if FlushTo returns an error.
+		c.lastFlush = c.total
 	}
 	c.mu.Unlock()
 
-	// Flush outside the lock to avoid blocking writers if FlushTo do I/O.
-	var flushed int
+	// Flush outside the lock to avoid blocking writers if FlushTo does I/O.
+	//
+	// Note: flushed records are replayed with context.Background(). The original
+	// request context (deadlines, trace IDs) is not available here because Handle
+	// does not store it. This is intentional for the black-box recorder pattern,
+	// but callers should be aware that FlushTo will not receive cancellation
+	// signals or tracing metadata from the originating request.
 	for _, fr := range flushRecords {
 		if err := c.flushTo.Handle(context.Background(), fr); err != nil {
-			// Update lastFlush for successfully flushed records before returning an error.
-			c.mu.Lock()
-			c.lastFlush += uint64(flushed)
-			c.mu.Unlock()
 			return err
 		}
-		flushed++
-	}
-	if flushed > 0 {
-		c.mu.Lock()
-		c.lastFlush += uint64(flushed)
-		c.mu.Unlock()
 	}
 	return nil
 }
@@ -191,6 +201,7 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 
 // All returns an iterator over stored records from oldest to newest.
 // The snapshot is taken under a read lock; the iteration itself holds no lock.
+// If MaxAge is set, records older than MaxAge are excluded.
 func (h *Handler) All() iter.Seq[slog.Record] {
 	snapshot := h.Records()
 	return func(yield func(slog.Record) bool) {
@@ -279,7 +290,10 @@ func (h *Handler) Capacity() int {
 	return len(c.buf)
 }
 
-// Clear removes all records from the buffer.
+// Clear removes all records from the buffer and resets flush state.
+// It does not wait for any in-flight flush: a concurrent Handle that has
+// already claimed its flush window will still deliver those records to FlushTo
+// after Clear returns. New records written after Clear form a fresh window.
 func (h *Handler) Clear() {
 	c := h.core
 	c.mu.Lock()
@@ -292,7 +306,9 @@ func (h *Handler) Clear() {
 }
 
 // WriteTo writes the buffered records as a JSON array to w.
-// It implements [io.WriterTo], making it composable with [http.ResponseWriter].
+// It implements [io.WriterTo] so it can be passed directly to helpers that
+// accept that interface, and can write directly to an [http.ResponseWriter].
+// If MaxAge is set, records older than MaxAge are excluded.
 func (h *Handler) WriteTo(w io.Writer) (int64, error) {
 	entries := recordsToEntries(h.Records())
 	data, err := json.Marshal(entries)
@@ -327,6 +343,7 @@ type jsonEntry struct {
 }
 
 // JSON returns the buffered records as a JSON array suitable for HTTP responses.
+// If MaxAge is set, records older than MaxAge are excluded.
 func (h *Handler) JSON() ([]byte, error) {
 	return json.Marshal(recordsToEntries(h.Records()))
 }

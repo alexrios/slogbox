@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"slices"
@@ -25,6 +26,15 @@ func TestNew_PanicsOnZeroSize(t *testing.T) {
 			New(size, nil)
 		})
 	}
+}
+
+func TestNew_PanicsOnNegativeMaxAge(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("New with negative MaxAge did not panic")
+		}
+	}()
+	New(10, &Options{MaxAge: -time.Second})
 }
 
 func TestHandle_BasicWrite(t *testing.T) {
@@ -384,6 +394,119 @@ func TestHandle_BufferSizeOne(t *testing.T) {
 	}
 }
 
+func TestWithAttrs_AfterConsumedGroup(t *testing.T) {
+	// After WithGroup("a").WithAttrs({x:1}), the pending group "a" is consumed
+	// (groupsUsed == len(groups)). A subsequent WithAttrs({y:2}) has no pending
+	// group so y is stored at the same level as Group("a"), not inside it.
+	// Record-level attrs still go inside Group("a") because Handle navigates
+	// through all groups when merging.
+	h := New(10, nil)
+	ctx := t.Context()
+
+	child := h.WithGroup("a").
+		WithAttrs([]slog.Attr{slog.String("x", "1")}).
+		WithAttrs([]slog.Attr{slog.String("y", "2")})
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(slog.String("z", "record"))
+	if err := child.(slog.Handler).Handle(ctx, r); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	recs := h.Records()
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+
+	top := map[string]any{}
+	recs[0].Attrs(func(a slog.Attr) bool {
+		top[a.Key] = a
+		return true
+	})
+
+	// y was added after the group was consumed: it sits at the top level.
+	if _, ok := top["y"]; !ok {
+		t.Error("y should be at top level (added after group 'a' was consumed)")
+	}
+	if _, ok := top["a"]; !ok {
+		t.Fatal("group 'a' missing")
+	}
+	aInner := map[string]string{}
+	for _, ga := range top["a"].(slog.Attr).Value.Group() {
+		aInner[ga.Key] = ga.Value.String()
+	}
+	// x was added while group "a" was pending: it is inside the group.
+	if aInner["x"] != "1" {
+		t.Errorf("a.x = %q, want \"1\"", aInner["x"])
+	}
+	// Record-level attrs go into the deepest active group.
+	if aInner["z"] != "record" {
+		t.Errorf("a.z = %q, want \"record\"", aInner["z"])
+	}
+}
+
+func TestMergeGroupAttrs_SiblingGroupPreserved(t *testing.T) {
+	// Construct a handler whose attr slice contains two sibling groups at the
+	// top level: Group("b", y=2) at index 0, Group("a", x=1) at index 1.
+	// When Handle navigates into Group("a") to place record attrs, the early
+	// return in mergeGroupAttrs must return the full existing slice — so
+	// Group("b") must still be present in the logged record.
+	h := New(10, nil)
+	ctx := t.Context()
+
+	// Add Group("b") directly as a handler-level attr (no pending group).
+	h1 := h.WithAttrs([]slog.Attr{slog.Group("b", slog.String("y", "2"))})
+	// h1.attrs = [Group("b",{y:2})], groups=[], groupsUsed=0
+
+	// WithGroup("a") + WithAttrs({x:1}) nests x inside a and appends Group("a")
+	// to h1.attrs, resulting in [Group("b",{y:2}), Group("a",{x:1})].
+	h2 := h1.WithGroup("a").WithAttrs([]slog.Attr{slog.String("x", "1")})
+	// h2.attrs = [Group("b",{y:2}), Group("a",{x:1})], groups=["a"], groupsUsed=1
+
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(slog.String("w", "record"))
+	if err := h2.(slog.Handler).Handle(ctx, r); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	recs := h.Records()
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+
+	// Collect top-level attrs into a map.
+	top := map[string]any{}
+	recs[0].Attrs(func(a slog.Attr) bool {
+		top[a.Key] = a
+		return true
+	})
+
+	// Group "b" must survive: mergeGroupAttrs returns the full existing slice.
+	bAttr, ok := top["b"]
+	if !ok {
+		t.Fatal("group 'b' missing from record attrs — sibling dropped by mergeGroupAttrs")
+	}
+	if bAttr.(slog.Attr).Value.Kind() != slog.KindGroup {
+		t.Fatalf("group 'b' is not a group: %v", bAttr)
+	}
+
+	// Group "a" must contain both the handler-level attr x and the record attr w.
+	aAttr, ok := top["a"]
+	if !ok {
+		t.Fatal("group 'a' missing from record attrs")
+	}
+	aInner := map[string]string{}
+	for _, ga := range aAttr.(slog.Attr).Value.Group() {
+		aInner[ga.Key] = ga.Value.String()
+	}
+	if aInner["x"] != "1" {
+		t.Errorf("a.x = %q, want \"1\"", aInner["x"])
+	}
+	if aInner["w"] != "record" {
+		t.Errorf("a.w = %q, want \"record\"", aInner["w"])
+	}
+}
+
 func TestWithGroup_Nested(t *testing.T) {
 	h := New(10, nil)
 	child := h.WithGroup("a").WithGroup("b").WithAttrs([]slog.Attr{slog.String("k", "v")})
@@ -416,6 +539,50 @@ func TestWithGroup_Nested(t *testing.T) {
 	}
 	if bGroup["k"] != "v" {
 		t.Errorf("attrs[a][b][k] = %v, want \"v\"", bGroup["k"])
+	}
+}
+
+func TestHandle_EmptyKeyAttrWithNonComparableValue(t *testing.T) {
+	// slog.Value.Equal panics on non-comparable types (slices, maps, functions)
+	// because it eventually calls v.Any() == w.Any() for KindAny values.
+	// The handler must not call a.Equal(slog.Attr{}); instead it checks
+	// a.Key == "" and a.Value.Resolve().Kind() to decide whether to skip.
+	//
+	// Rule: skip empty-keyed attrs whose resolved kind is NOT KindGroup.
+	// Inline groups (empty key + KindGroup) must be preserved — they are
+	// a slog.Handler contract requirement tested by slogtest.
+	h := New(10, nil)
+	ctx := t.Context()
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
+	r.AddAttrs(slog.Any("", []int{1, 2, 3}))          // empty key, non-comparable value → dropped
+	r.AddAttrs(slog.Group("", slog.String("c", "d"))) // inline group → kept
+	r.AddAttrs(slog.String("keep", "yes"))             // normal attr → kept
+	if err := h.Handle(ctx, r); err != nil {
+		t.Fatalf("Handle panicked or errored: %v", err)
+	}
+	recs := h.Records()
+	if len(recs) != 1 {
+		t.Fatalf("got %d records, want 1", len(recs))
+	}
+	top := map[string]slog.Attr{}
+	recs[0].Attrs(func(a slog.Attr) bool {
+		top[a.Key] = a
+		return true
+	})
+
+	// The empty-key non-group attr must be dropped (would panic via Equal).
+	for k, a := range top {
+		if k == "" && a.Value.Kind() != slog.KindGroup {
+			t.Errorf("empty-key non-group attr not filtered: %v", a)
+		}
+	}
+	// Inline group must be preserved.
+	if _, ok := top[""]; !ok {
+		t.Error("inline group (empty key + KindGroup) was incorrectly dropped")
+	}
+	// Normal attr must survive.
+	if top["keep"].Value.String() != "yes" {
+		t.Errorf("keep = %q, want \"yes\"", top["keep"].Value.String())
 	}
 }
 
@@ -498,20 +665,24 @@ func TestJSON_NestedGroups(t *testing.T) {
 
 // collectingHandler is a slog.Handler that appends records to a slice.
 type collectingHandler struct {
-	mu      sync.Mutex
-	records []slog.Record
-	err     error // if non-nil, Handle returns this error
+	mu         sync.Mutex
+	recs       []slog.Record
+	err        error      // if non-nil, Handle returns this error
+	handleFunc func()     // optional hook called inside Handle (outside mu)
 }
 
 func (ch *collectingHandler) Enabled(context.Context, slog.Level) bool { return true }
 
 func (ch *collectingHandler) Handle(_ context.Context, r slog.Record) error {
+	if ch.handleFunc != nil {
+		ch.handleFunc()
+	}
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
 	if ch.err != nil {
 		return ch.err
 	}
-	ch.records = append(ch.records, r)
+	ch.recs = append(ch.recs, r)
 	return nil
 }
 
@@ -521,14 +692,26 @@ func (ch *collectingHandler) WithGroup(string) slog.Handler      { return ch }
 func (ch *collectingHandler) len() int {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	return len(ch.records)
+	return len(ch.recs)
+}
+
+func (ch *collectingHandler) records() []slog.Record {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	return append([]slog.Record(nil), ch.recs...)
+}
+
+func (ch *collectingHandler) reset() {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+	ch.recs = nil
 }
 
 func (ch *collectingHandler) messages() []string {
 	ch.mu.Lock()
 	defer ch.mu.Unlock()
-	msgs := make([]string, len(ch.records))
-	for i, r := range ch.records {
+	msgs := make([]string, len(ch.recs))
+	for i, r := range ch.recs {
 		msgs[i] = r.Message
 	}
 	return msgs
@@ -739,6 +922,105 @@ func TestFlush_Concurrent(t *testing.T) {
 
 	if n := collector.len(); n == 0 {
 		t.Error("expected flush records from concurrent errors")
+	}
+}
+
+func TestFlush_ClearDuringFlush(t *testing.T) {
+	// Verify that Clear() racing with an in-flight flush does not cause stale
+	// pre-Clear records to appear in the next flush window.
+	//
+	// Mechanism: lastFlush is claimed inside the write lock before flushing
+	// begins. Clear() resets lastFlush to 0 under the same lock. The next
+	// ERROR therefore computes its window from lastFlush=0 and can only see
+	// records written after Clear().
+	ready := make(chan struct{})
+	proceed := make(chan struct{})
+
+	collector := &collectingHandler{
+		handleFunc: func() {
+			// Signal we're inside Handle, then wait for Clear to complete.
+			select {
+			case ready <- struct{}{}:
+				<-proceed
+			default:
+			}
+		},
+	}
+
+	h := New(100, &Options{
+		Level:   slog.LevelInfo,
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+
+	// Seed some records then trigger flush in a goroutine.
+	for range 5 {
+		logger.Info("before")
+	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		logger.Error("trigger")
+	}()
+
+	// Wait until the flush goroutine is inside flushTo.Handle, then Clear.
+	<-ready
+	h.Clear()
+	close(proceed)
+	wg.Wait()
+
+	// After Clear and a new error, the flush window is computed from
+	// lastFlush=0 and should only include records written after Clear.
+	logger.Info("after-clear")
+	collector.reset()
+	logger.Error("new-trigger")
+
+	got := collector.records()
+	for _, r := range got {
+		if r.Message == "before" {
+			t.Errorf("stale pre-Clear record appeared in post-Clear flush: %q", r.Message)
+		}
+	}
+}
+
+func TestFlush_NoDuplicates(t *testing.T) {
+	// Two goroutines trigger flush concurrently. Each claims its window inside
+	// the write lock, so records must appear at most once across all flushes.
+	collector := &collectingHandler{}
+	h := New(200, &Options{
+		Level:   slog.LevelInfo,
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+
+	// Write uniquely-named INFO records so duplicates are detectable.
+	const seed = 50
+	for i := range seed {
+		logger.Info(fmt.Sprintf("seed-%d", i))
+	}
+
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			logger.Error("trigger")
+		}()
+	}
+	wg.Wait()
+
+	seen := map[string]int{}
+	for _, r := range collector.records() {
+		key := fmt.Sprintf("%s|%s", r.Message, r.Time.String())
+		seen[key]++
+	}
+	for key, n := range seen {
+		if n > 1 {
+			t.Errorf("record %q flushed %d times (want ≤1)", key, n)
+		}
 	}
 }
 

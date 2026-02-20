@@ -41,7 +41,10 @@ func main() {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Write(data)
+		if _, err := w.Write(data); err != nil {
+			// Response headers already sent; log the write failure.
+			slog.Error("debug/logs: write error", "err", err)
+		}
 	})
 
 	slog.Info("server starting", "port", 8080)
@@ -97,7 +100,9 @@ Serve the ring buffer over HTTP with `WriteTo`:
 ```go
 http.HandleFunc("GET /debug/logs", func(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	rec.WriteTo(w) // implements io.WriterTo
+	if _, err := rec.WriteTo(w); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
 })
 ```
 
