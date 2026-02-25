@@ -1,12 +1,21 @@
 // Package slogbox provides a [slog.Handler] that keeps the last N log records
 // in a circular buffer. It is designed for exposing recent logs via health check
 // or admin HTTP endpoints.
+//
+// When FlushOn/FlushTo are configured, records are automatically forwarded on
+// level-triggered thresholds. [Handler.Flush] provides explicit draining for
+// graceful shutdown. [Handler.TotalRecords] and [Handler.PendingFlushCount]
+// expose buffer throughput for monitoring.
+//
+// Flushed records are replayed with the caller-provided context (for explicit
+// [Handler.Flush]) or [context.Background] (for level-triggered flushes). The
+// original request context is intentionally not stored per record to avoid GC
+// pressure from retained context chains and stale deadlines.
 package slogbox
 
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"iter"
 	"log/slog"
 	"slices"
@@ -20,15 +29,18 @@ type Options struct {
 	// If Level is nil, the handler assumes LevelInfo.
 	Level slog.Leveler
 
-	// FlushOn sets the level threshold that triggers a flush of buffered records
-	// to FlushTo. Both FlushOn and FlushTo must be set for flush to be active.
+	// FlushOn sets the level threshold that triggers an automatic flush of
+	// buffered records to FlushTo. Both FlushOn and FlushTo must be set for
+	// level-triggered flush to be active.
 	// Flush errors are returned by Handle. Records are claimed before flushing
 	// begins: at-most-once delivery — a record is never re-sent even if
 	// FlushTo.Handle returns an error.
 	FlushOn slog.Leveler
 
 	// FlushTo is the destination handler for flushed records.
-	// Both FlushOn and FlushTo must be set for flush to be active.
+	// Required for both level-triggered flush (with FlushOn) and explicit
+	// [Handler.Flush] calls. Setting FlushTo without FlushOn enables a
+	// manual-only pattern where records are never flushed automatically.
 	//
 	// FlushTo must not directly or indirectly log back to the same slogbox Handler;
 	// doing so will deadlock.
@@ -70,10 +82,10 @@ func New(size int, opts *Options) *Handler {
 		buf: make([]slog.Record, size),
 	}
 	if opts != nil {
-		if opts.FlushOn != nil && opts.FlushTo != nil {
-			c.flushOn = opts.FlushOn
-			c.flushTo = opts.FlushTo
-		}
+		// FlushOn and FlushTo are stored independently. Level-triggered flush
+		// (in Handle) requires both, but explicit Flush() only needs FlushTo.
+		c.flushOn = opts.FlushOn
+		c.flushTo = opts.FlushTo
 		if opts.MaxAge < 0 {
 			panic("slogbox: MaxAge must be non-negative")
 		}
@@ -218,6 +230,24 @@ func (h *Handler) Records() []slog.Record {
 	return out
 }
 
+// RecordsAbove returns a snapshot of stored records whose level is >= minLevel,
+// from oldest to newest. If MaxAge is set, old records are excluded before
+// level filtering. The semantics match [Handler.Enabled]: a record is included
+// when its level reaches or exceeds minLevel.
+func (h *Handler) RecordsAbove(minLevel slog.Level) []slog.Record {
+	return filterByLevel(h.Records(), minLevel)
+}
+
+func filterByLevel(records []slog.Record, minLevel slog.Level) []slog.Record {
+	out := make([]slog.Record, 0, len(records))
+	for _, r := range records {
+		if r.Level >= minLevel {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // Len returns the number of records physically stored in the buffer.
 // It does not apply MaxAge filtering.
 func (h *Handler) Len() int {
@@ -230,6 +260,75 @@ func (h *Handler) Len() int {
 // Capacity returns the total buffer capacity (the size passed to [New]).
 func (h *Handler) Capacity() int {
 	return len(h.core.buf) // buf is allocated once in New and never resized
+}
+
+// TotalRecords returns the total number of records ever written to the buffer.
+// The counter is monotonically increasing and survives wrap-around; it is only
+// reset by [Handler.Clear].
+func (h *Handler) TotalRecords() uint64 {
+	c := h.core
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.total
+}
+
+// PendingFlushCount returns the number of records that would be flushed by
+// [Handler.Flush] or the next level-triggered flush. Returns 0 if [Options.FlushTo]
+// is not set.
+func (h *Handler) PendingFlushCount() int {
+	c := h.core
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.flushTo == nil {
+		return 0
+	}
+	n := min(c.total-c.lastFlush, uint64(c.count))
+	return int(n)
+}
+
+// Flush explicitly drains pending records to [Options.FlushTo]. It is intended
+// for graceful shutdown sequences where buffered records would otherwise be lost.
+//
+// Flush only requires [Options.FlushTo] to be set; [Options.FlushOn] is not
+// needed. This allows a manual-only flush pattern where records are never
+// flushed automatically but can be drained on demand.
+//
+// Flush is a no-op (returns nil) when FlushTo is not configured, when the
+// buffer is empty, or when all records have already been flushed.
+//
+// The flush window is claimed under the write lock before delivery begins
+// (same at-most-once semantics as [Handler.Handle]). The provided context is
+// passed to each FlushTo.Handle call; ctx.Err() is checked between records to
+// support early cancellation.
+//
+// On error (from FlushTo or context cancellation), Flush returns immediately.
+// Records delivered before the error are not retried; records not yet delivered
+// are lost because the flush window was already claimed.
+func (h *Handler) Flush(ctx context.Context) error {
+	c := h.core
+	if c.flushTo == nil {
+		return nil
+	}
+
+	c.mu.Lock()
+	n := min(c.total-c.lastFlush, uint64(c.count))
+	if n == 0 {
+		c.mu.Unlock()
+		return nil
+	}
+	flushRecords := c.snapshotLast(int(n))
+	c.lastFlush = c.total
+	c.mu.Unlock()
+
+	for _, fr := range flushRecords {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := c.flushTo.Handle(ctx, fr); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Clear removes all records from the buffer and resets flush state.
@@ -245,20 +344,6 @@ func (h *Handler) Clear() {
 	c.count = 0
 	c.total = 0
 	c.lastFlush = 0
-}
-
-// WriteTo writes the buffered records as a JSON array to w.
-// It implements [io.WriterTo] so it can be passed directly to helpers that
-// accept that interface, and can write directly to an [http.ResponseWriter].
-// If MaxAge is set, records older than MaxAge are excluded.
-func (h *Handler) WriteTo(w io.Writer) (int64, error) {
-	entries := recordsToEntries(h.Records())
-	data, err := json.Marshal(entries)
-	if err != nil {
-		return 0, err
-	}
-	n, err := w.Write(data)
-	return int64(n), err
 }
 
 // jsonEntry is the shape of each record in the JSON output.

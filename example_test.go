@@ -2,9 +2,13 @@ package slogbox_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"time"
 
 	"github.com/alexrios/slogbox"
 )
@@ -91,4 +95,35 @@ func ExampleHandler_WriteTo() {
 	// Output:
 	// first
 	// second
+}
+
+func ExampleHandler_Flush() {
+	target := slog.NewJSONHandler(io.Discard, nil)
+	h := slogbox.New(100, &slogbox.Options{
+		FlushTo: target,
+	})
+	logger := slog.New(h)
+
+	logger.Info("buffered event")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := h.Flush(ctx); err != nil {
+		fmt.Println("flush error:", err)
+	}
+	fmt.Println("pending after flush:", h.PendingFlushCount())
+	// Output:
+	// pending after flush: 0
+}
+
+func ExampleHTTPHandler() {
+	h := slogbox.New(100, nil)
+	logger := slog.New(h)
+
+	logger.Info("request handled", "status", 200)
+
+	http.Handle("/debug/logs", slogbox.HTTPHandler(h, nil))
+	fmt.Println("handler registered")
+	// Output:
+	// handler registered
 }

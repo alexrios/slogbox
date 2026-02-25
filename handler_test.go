@@ -1191,6 +1191,290 @@ func TestFlush_ErrorMidBatch(t *testing.T) {
 	}
 }
 
+// --- Explicit Flush tests ---
+
+func TestFlush_DrainsPendingRecords(t *testing.T) {
+	collector := &collectingHandler{}
+	h := New(100, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+
+	logger.Info("one")
+	logger.Warn("two")
+	logger.Info("three")
+
+	// No level-triggered flush yet.
+	if n := collector.len(); n != 0 {
+		t.Fatalf("pre-flush: collector has %d records, want 0", n)
+	}
+
+	if err := h.Flush(t.Context()); err != nil {
+		t.Fatalf("Flush() error: %v", err)
+	}
+
+	msgs := collector.messages()
+	want := []string{"one", "two", "three"}
+	if !slices.Equal(msgs, want) {
+		t.Errorf("flushed messages = %v, want %v", msgs, want)
+	}
+}
+
+func TestFlush_NoopWithoutConfig(t *testing.T) {
+	h := New(10, nil) // no FlushOn/FlushTo
+	logger := slog.New(h)
+	logger.Info("msg")
+
+	if err := h.Flush(t.Context()); err != nil {
+		t.Errorf("Flush() = %v, want nil", err)
+	}
+}
+
+func TestFlush_NoopWhenEmpty(t *testing.T) {
+	collector := &collectingHandler{}
+	h := New(10, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+
+	if err := h.Flush(t.Context()); err != nil {
+		t.Errorf("Flush() = %v, want nil", err)
+	}
+	if n := collector.len(); n != 0 {
+		t.Errorf("collector has %d records, want 0", n)
+	}
+}
+
+func TestFlush_NoopWhenAlreadyFlushed(t *testing.T) {
+	collector := &collectingHandler{}
+	h := New(100, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+
+	logger.Info("one")
+	logger.Error("trigger") // level-triggered flush drains all
+
+	before := collector.len()
+	collector.reset()
+
+	if err := h.Flush(t.Context()); err != nil {
+		t.Fatalf("Flush() error: %v", err)
+	}
+	if n := collector.len(); n != 0 {
+		t.Errorf("Flush() delivered %d records after level-flush (had %d before reset), want 0", n, before)
+	}
+}
+
+func TestFlush_ExplicitErrorPropagation(t *testing.T) {
+	errBoom := errors.New("boom")
+	target := &collectingHandler{err: errBoom}
+	h := New(100, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: target,
+	})
+	logger := slog.New(h)
+	logger.Info("msg")
+
+	err := h.Flush(t.Context())
+	if !errors.Is(err, errBoom) {
+		t.Errorf("Flush() = %v, want %v", err, errBoom)
+	}
+}
+
+func TestFlush_PartialDeliveryOnError(t *testing.T) {
+	// When FlushTo errors on record N, records 1..N-1 are still delivered.
+	// This verifies the documented partial-delivery behavior.
+	collector := &collectingHandler{}
+	errBoom := errors.New("boom on 3rd")
+	target := &nthErrorHandler{n: 3, err: errBoom, wrapped: collector}
+	h := New(100, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: target,
+	})
+	logger := slog.New(h)
+	for i := range 5 {
+		logger.Info(fmt.Sprintf("msg-%d", i))
+	}
+
+	err := h.Flush(t.Context())
+	if !errors.Is(err, errBoom) {
+		t.Fatalf("Flush() = %v, want %v", err, errBoom)
+	}
+
+	// Records 0 and 1 should have been delivered before the error on record 2 (3rd call).
+	msgs := collector.messages()
+	if len(msgs) != 2 {
+		t.Errorf("delivered %d records, want 2 (partial delivery before error); got %v", len(msgs), msgs)
+	}
+}
+
+func TestFlush_CanceledContext(t *testing.T) {
+	// Use a slow handler to ensure ctx check runs between records.
+	collector := &collectingHandler{}
+	h := New(100, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+	for range 5 {
+		logger.Info("msg")
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // cancel immediately
+
+	err := h.Flush(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Flush() = %v, want context.Canceled", err)
+	}
+	// With an already-canceled context, no records should be delivered.
+	if n := collector.len(); n != 0 {
+		t.Errorf("collector has %d records, want 0 (ctx canceled before first record)", n)
+	}
+}
+
+func TestFlush_ManualOnlyFlushTo(t *testing.T) {
+	// FlushTo without FlushOn: no level-triggered flush, but explicit Flush works.
+	collector := &collectingHandler{}
+	h := New(100, &Options{
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+	logger.Info("one")
+	logger.Info("two")
+	logger.Error("three") // should NOT trigger automatic flush (no FlushOn)
+
+	if n := collector.len(); n != 0 {
+		t.Fatalf("level-triggered flush fired without FlushOn: got %d records", n)
+	}
+
+	if err := h.Flush(t.Context()); err != nil {
+		t.Fatalf("Flush() error: %v", err)
+	}
+
+	msgs := collector.messages()
+	want := []string{"one", "two", "three"}
+	if !slices.Equal(msgs, want) {
+		t.Errorf("Flush() delivered %v, want %v", msgs, want)
+	}
+}
+
+func TestFlush_ManualOnlyPendingFlushCount(t *testing.T) {
+	collector := &collectingHandler{}
+	h := New(100, &Options{
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+	logger.Info("one")
+	logger.Info("two")
+
+	if got := h.PendingFlushCount(); got != 2 {
+		t.Errorf("PendingFlushCount() = %d, want 2", got)
+	}
+}
+
+func TestFlush_ConcurrentWithHandle(t *testing.T) {
+	collector := &collectingHandler{}
+	h := New(1000, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+
+	var wg sync.WaitGroup
+	// Writers
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				logger.Info("msg")
+			}
+		}()
+	}
+	// Flushers
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 10 {
+				_ = h.Flush(t.Context())
+			}
+		}()
+	}
+	wg.Wait()
+	// No race detector failures is the success criterion.
+}
+
+// --- RecordsAbove tests ---
+
+func TestRecordsAbove_FiltersCorrectly(t *testing.T) {
+	h := New(100, &Options{Level: slog.LevelDebug})
+	ctx := t.Context()
+	for _, lv := range []slog.Level{slog.LevelInfo, slog.LevelWarn, slog.LevelError, slog.LevelInfo} {
+		r := slog.NewRecord(time.Now(), lv, lv.String(), 0)
+		_ = h.Handle(ctx, r)
+	}
+
+	got := h.RecordsAbove(slog.LevelWarn)
+	if len(got) != 2 {
+		t.Fatalf("RecordsAbove(WARN) = %d records, want 2", len(got))
+	}
+	if got[0].Level != slog.LevelWarn {
+		t.Errorf("got[0].Level = %v, want WARN", got[0].Level)
+	}
+	if got[1].Level != slog.LevelError {
+		t.Errorf("got[1].Level = %v, want ERROR", got[1].Level)
+	}
+}
+
+func TestRecordsAbove_EmptyResult(t *testing.T) {
+	h := New(100, nil)
+	logger := slog.New(h)
+	logger.Info("below")
+	logger.Info("also below")
+
+	got := h.RecordsAbove(slog.LevelError)
+	if len(got) != 0 {
+		t.Errorf("RecordsAbove(ERROR) = %d records, want 0", len(got))
+	}
+}
+
+func TestRecordsAbove_AllMatch(t *testing.T) {
+	h := New(100, &Options{Level: slog.LevelDebug})
+	ctx := t.Context()
+	for _, lv := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn} {
+		r := slog.NewRecord(time.Now(), lv, lv.String(), 0)
+		_ = h.Handle(ctx, r)
+	}
+
+	got := h.RecordsAbove(slog.LevelDebug)
+	if len(got) != 3 {
+		t.Fatalf("RecordsAbove(DEBUG) = %d records, want 3", len(got))
+	}
+}
+
+func TestRecordsAbove_RespectsMaxAge(t *testing.T) {
+	h := New(100, &Options{MaxAge: time.Minute, Level: slog.LevelDebug})
+	ctx := t.Context()
+
+	old := slog.NewRecord(time.Now().Add(-2*time.Minute), slog.LevelError, "old-error", 0)
+	_ = h.Handle(ctx, old)
+	recent := slog.NewRecord(time.Now(), slog.LevelError, "recent-error", 0)
+	_ = h.Handle(ctx, recent)
+
+	got := h.RecordsAbove(slog.LevelError)
+	if len(got) != 1 {
+		t.Fatalf("RecordsAbove(ERROR) = %d records, want 1", len(got))
+	}
+	if got[0].Message != "recent-error" {
+		t.Errorf("got[0].Message = %q, want %q", got[0].Message, "recent-error")
+	}
+}
+
 // --- MaxAge tests ---
 
 func TestMaxAge_FiltersOldRecords(t *testing.T) {
@@ -1297,6 +1581,85 @@ func TestMaxAge_LenIgnoresMaxAge(t *testing.T) {
 
 	if h.Len() != 2 {
 		t.Errorf("Len() = %d, want 2 (physical count)", h.Len())
+	}
+}
+
+// --- Accessor tests ---
+
+func TestTotalRecords_IncrementsOnWrite(t *testing.T) {
+	h := New(100, nil)
+	logger := slog.New(h)
+	for i := range 5 {
+		logger.Info("msg", "i", i)
+	}
+	if got := h.TotalRecords(); got != 5 {
+		t.Errorf("TotalRecords() = %d, want 5", got)
+	}
+}
+
+func TestTotalRecords_SurvivesWrapAround(t *testing.T) {
+	h := New(3, nil) // capacity 3
+	logger := slog.New(h)
+	for i := range 10 {
+		logger.Info("msg", "i", i)
+	}
+	if got := h.TotalRecords(); got != 10 {
+		t.Errorf("TotalRecords() = %d, want 10", got)
+	}
+	if h.Len() != 3 {
+		t.Errorf("Len() = %d, want 3", h.Len())
+	}
+}
+
+func TestTotalRecords_ResetByClear(t *testing.T) {
+	h := New(10, nil)
+	logger := slog.New(h)
+	logger.Info("one")
+	logger.Info("two")
+	h.Clear()
+	if got := h.TotalRecords(); got != 0 {
+		t.Errorf("TotalRecords() after Clear = %d, want 0", got)
+	}
+}
+
+func TestPendingFlushCount_NoConfig(t *testing.T) {
+	h := New(10, nil)
+	logger := slog.New(h)
+	logger.Info("msg")
+	if got := h.PendingFlushCount(); got != 0 {
+		t.Errorf("PendingFlushCount() = %d, want 0 (flush not configured)", got)
+	}
+}
+
+func TestPendingFlushCount_TracksUnflushed(t *testing.T) {
+	collector := &collectingHandler{}
+	h := New(100, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+	logger.Info("one")
+	logger.Warn("two")
+	logger.Info("three")
+
+	if got := h.PendingFlushCount(); got != 3 {
+		t.Errorf("PendingFlushCount() = %d, want 3", got)
+	}
+}
+
+func TestPendingFlushCount_ResetsAfterFlush(t *testing.T) {
+	collector := &collectingHandler{}
+	h := New(100, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: collector,
+	})
+	logger := slog.New(h)
+	logger.Info("one")
+	logger.Warn("two")
+	logger.Error("trigger") // triggers level-based flush
+
+	if got := h.PendingFlushCount(); got != 0 {
+		t.Errorf("PendingFlushCount() after flush = %d, want 0", got)
 	}
 }
 
@@ -1411,10 +1774,79 @@ func TestWriteTo_WriterError(t *testing.T) {
 	}
 }
 
+func TestWriteTo_OutputIsValidJSONArray(t *testing.T) {
+	h := New(10, nil)
+	logger := slog.New(h)
+	logger.Info("one", "k", "v")
+	logger.Warn("two")
+
+	var buf bytes.Buffer
+	_, err := h.WriteTo(&buf)
+	if err != nil {
+		t.Fatalf("WriteTo() error: %v", err)
+	}
+
+	raw := buf.Bytes()
+	// Must start with '[' and the last non-whitespace byte must be ']'.
+	trimmed := bytes.TrimRight(raw, " \t\r\n")
+	if len(trimmed) == 0 {
+		t.Fatal("WriteTo produced empty output")
+	}
+	if trimmed[0] != '[' {
+		t.Errorf("output starts with %q, want '['", trimmed[0])
+	}
+	if trimmed[len(trimmed)-1] != ']' {
+		t.Errorf("output ends with %q, want ']'", trimmed[len(trimmed)-1])
+	}
+
+	// Must be valid JSON.
+	var entries []json.RawMessage
+	if err := json.Unmarshal(trimmed, &entries); err != nil {
+		t.Fatalf("output is not valid JSON: %v\nraw: %s", err, raw)
+	}
+	if len(entries) != 2 {
+		t.Errorf("got %d entries, want 2", len(entries))
+	}
+
+	// Output must not have trailing whitespace — ensures both build paths
+	// (standard json.Marshal and streaming jsontext.Encoder) produce
+	// byte-compatible output.
+	if len(raw) != len(trimmed) {
+		t.Errorf("WriteTo has %d trailing whitespace byte(s): %q",
+			len(raw)-len(trimmed), raw[len(trimmed):])
+	}
+}
+
 // Verify Handler implements io.WriterTo.
 var _ io.WriterTo = (*Handler)(nil)
 
 // --- Internal unit tests (white-box) ---
+
+func TestSnapshotLast_WrapAround(t *testing.T) {
+	// buf=4, write 5 records → head=1, count=4.
+	// snapshotLast(4): start=(1-4+4)%4=1, start+4=5 > 4 → wrap path (lines 50-52).
+	h := New(4, nil)
+	ctx := t.Context()
+	for i := range 5 {
+		r := slog.NewRecord(time.Now(), slog.LevelInfo, fmt.Sprintf("msg-%d", i), 0)
+		_ = h.Handle(ctx, r)
+	}
+
+	c := h.core
+	c.mu.RLock()
+	got := c.snapshotLast(4)
+	c.mu.RUnlock()
+
+	want := []string{"msg-1", "msg-2", "msg-3", "msg-4"}
+	if len(got) != len(want) {
+		t.Fatalf("snapshotLast(4) returned %d records, want %d", len(got), len(want))
+	}
+	for i, r := range got {
+		if r.Message != want[i] {
+			t.Errorf("got[%d].Message = %q, want %q", i, r.Message, want[i])
+		}
+	}
+}
 
 func TestSnapshotLast_Zero(t *testing.T) {
 	// snapshotLast(0) must return nil without panicking.

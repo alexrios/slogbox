@@ -3,6 +3,7 @@ package slogbox
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
 	"testing"
 	"time"
@@ -177,6 +178,46 @@ func BenchmarkWriteTo(b *testing.B) {
 	for b.Loop() {
 		buf.Reset()
 		_, _ = h.WriteTo(&buf)
+	}
+}
+
+func BenchmarkWriteTo_LargeBuffer(b *testing.B) {
+	h := New(10000, nil)
+	ctx := b.Context()
+	for range 10000 {
+		r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
+		r.AddAttrs(
+			slog.String("method", "GET"),
+			slog.Int("status", 200),
+			slog.Duration("latency", 42*time.Millisecond),
+			slog.String("path", "/api/v1/users"),
+			slog.String("ip", "10.0.0.1"),
+		)
+		_ = h.Handle(ctx, r)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		_, _ = h.WriteTo(io.Discard)
+	}
+}
+
+func BenchmarkFlush(b *testing.B) {
+	h := New(1024, &Options{
+		FlushOn: slog.LevelError,
+		FlushTo: discardHandler{},
+	})
+	ctx := b.Context()
+	info := slog.NewRecord(time.Now(), slog.LevelInfo, "fill", 0)
+	info.AddAttrs(slog.String("key", "value"))
+
+	b.ReportAllocs()
+	for b.Loop() {
+		// Write 100 INFO records, then flush explicitly.
+		for range 100 {
+			_ = h.Handle(ctx, info)
+		}
+		_ = h.Flush(ctx)
 	}
 }
 
