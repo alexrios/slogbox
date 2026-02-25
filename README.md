@@ -175,6 +175,10 @@ When built with the jsonv2 experiment, `WriteTo` streams records through
 | WriteTo (10K records, B/op) | 16,300,000 | 2,885,115 | **6x less memory** |
 | WriteTo (10K records, allocs/op) | 190,026 | 35 | **5400x fewer allocs** |
 
+## Design notes
+
+[Building slogbox](https://alexrios.me/blog/slogbox-devlog/) — design decisions, tradeoffs, and lessons learned.
+
 ## License
 
 [GPL-3.0](LICENSE)
