@@ -23,5 +23,11 @@ jobs:
       - name: Test
         run: go test -v -race -coverprofile=coverage.out ./...
 
-      - name: Benchmark
+      - name: Vet (JSON v1 fallback)
+        run: mise run lint-v1
+
+      - name: Test (JSON v1 fallback)
+        run: mise run test-v1
+
+      - name: Benchmark (JSON v2)
         run: mise run bench
