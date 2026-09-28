@@ -7,6 +7,7 @@ import (
 	"encoding/json/jsontext"
 	jsonv2 "encoding/json/v2"
 	"io"
+	"reflect"
 )
 
 // JSON returns the buffered records as a JSON array suitable for HTTP responses.
@@ -125,15 +126,15 @@ func normalizeAny(v any) any {
 }
 
 func supportsJSONV2Marshaling(v any) bool {
-	if _, ok := v.(jsonv2.MarshalerTo); ok {
-		return true
+	t := reflect.TypeOf(v)
+	// JSON v2 also calls pointer-receiver methods on non-pointer values.
+	for _, t := range [2]reflect.Type{t, reflect.PointerTo(t)} {
+		if t.Implements(reflect.TypeFor[jsonv2.MarshalerTo]()) ||
+			t.Implements(reflect.TypeFor[jsonv2.Marshaler]()) ||
+			t.Implements(reflect.TypeFor[encoding.TextAppender]()) ||
+			t.Implements(reflect.TypeFor[encoding.TextMarshaler]()) {
+			return true
+		}
 	}
-	if _, ok := v.(jsonv2.Marshaler); ok {
-		return true
-	}
-	if _, ok := v.(encoding.TextAppender); ok {
-		return true
-	}
-	_, ok := v.(encoding.TextMarshaler)
-	return ok
+	return false
 }

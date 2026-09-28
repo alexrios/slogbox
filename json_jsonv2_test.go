@@ -216,6 +216,77 @@ func (textAppenderError) AppendText(dst []byte) ([]byte, error) {
 	return append(dst, "text-appender"...), nil
 }
 
+type pointerMarshalerError struct{ error }
+
+func (*pointerMarshalerError) MarshalJSON() ([]byte, error) {
+	return []byte(`"redacted-json"`), nil
+}
+
+type pointerMarshalerToError struct{ error }
+
+func (*pointerMarshalerToError) MarshalJSONTo(enc *jsontext.Encoder) error {
+	return enc.WriteToken(jsontext.String("redacted-json-to"))
+}
+
+type pointerTextMarshalerError struct{ error }
+
+func (*pointerTextMarshalerError) MarshalText() ([]byte, error) {
+	return []byte("redacted-text"), nil
+}
+
+type pointerTextAppenderError struct{ error }
+
+func (*pointerTextAppenderError) AppendText(dst []byte) ([]byte, error) {
+	return append(dst, "redacted-text-append"...), nil
+}
+
+func TestJSONV2_PreservesPointerMarshalersOnErrorValues(t *testing.T) {
+	errRaw := errors.New("raw:sensitive-detail")
+	h := New(1, nil)
+	slog.New(h).Info("custom errors",
+		"json", pointerMarshalerError{errRaw},
+		"json_to", pointerMarshalerToError{errRaw},
+		"text", pointerTextMarshalerError{errRaw},
+		"text_append", pointerTextAppenderError{errRaw},
+	)
+
+	outputs := map[string]func() ([]byte, error){
+		"JSON": h.JSON,
+		"WriteTo": func() ([]byte, error) {
+			var buf bytes.Buffer
+			_, err := h.WriteTo(&buf)
+			return buf.Bytes(), err
+		},
+	}
+	for name, output := range outputs {
+		t.Run(name, func(t *testing.T) {
+			data, err := output()
+			if err != nil {
+				t.Fatalf("%s() error: %v", name, err)
+			}
+			var entries []struct {
+				Attrs map[string]string `json:"attrs"`
+			}
+			if err := json.Unmarshal(data, &entries); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("got %d entries, want 1", len(entries))
+			}
+			for key, want := range map[string]string{
+				"json":        "redacted-json",
+				"json_to":     "redacted-json-to",
+				"text":        "redacted-text",
+				"text_append": "redacted-text-append",
+			} {
+				if got := entries[0].Attrs[key]; got != want {
+					t.Errorf("%s = %q, want %q", key, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestJSONV2_PreservesV2MarshalersOnErrors(t *testing.T) {
 	var _ jsonv2.MarshalerTo = marshalerToError{}
 

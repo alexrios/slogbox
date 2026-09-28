@@ -34,7 +34,7 @@ fi
 run_mode() {
 	local mode=$1
 	local destination=$2
-	local experiment=()
+	local experiment=(GOEXPERIMENT=jsonv2)
 	if [[ $mode == v1 ]]; then
 		experiment=(GOEXPERIMENT=nojsonv2)
 	fi
