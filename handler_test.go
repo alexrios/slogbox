@@ -245,6 +245,169 @@ func TestJSON(t *testing.T) {
 	}
 }
 
+type marshalingError struct {
+	Code string
+}
+
+func (e marshalingError) Error() string { return "error " + e.Code }
+
+func (e marshalingError) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf(`{"code":%q}`, e.Code)), nil
+}
+
+type textMarshalingError struct {
+	Code string
+}
+
+func (e textMarshalingError) Error() string { return "text error " + e.Code }
+
+func (e textMarshalingError) MarshalText() ([]byte, error) {
+	return []byte("text:" + e.Code), nil
+}
+
+type nilMarshalingError struct {
+	Message string
+}
+
+func (e *nilMarshalingError) Error() string { return e.Message }
+
+func (e *nilMarshalingError) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf(`{"message":%q}`, e.Message)), nil
+}
+
+func TestJSON_NativeSlogKindsAndErrors(t *testing.T) {
+	wantTime := time.Date(2026, time.August, 22, 12, 34, 56, 789, time.UTC)
+	h := New(1, nil)
+	r := slog.NewRecord(wantTime, slog.LevelInfo, "native kinds", 0)
+	r.AddAttrs(
+		slog.Bool("bool", true),
+		slog.Duration("duration", 42*time.Millisecond),
+		slog.Float64("float64", 1.5),
+		slog.Int64("int64", -42),
+		slog.String("string", "value"),
+		slog.Time("time", wantTime),
+		slog.Uint64("uint64", 42),
+		slog.Any("any", map[string]any{"nested": "value"}),
+		slog.Any("error", errors.New("plain error")),
+		slog.Any("marshaling_error", marshalingError{Code: "E_TEST"}),
+		slog.Any("text_marshaling_error", textMarshalingError{Code: "E_TEXT"}),
+		slog.Any("logvaluer", tokenValue{raw: "secret"}),
+		slog.Group("group", slog.String("child", "value")),
+	)
+	if err := h.Handle(t.Context(), r); err != nil {
+		t.Fatalf("Handle() error: %v", err)
+	}
+
+	outputs := map[string]func() ([]byte, error){
+		"JSON": h.JSON,
+		"WriteTo": func() ([]byte, error) {
+			var buf bytes.Buffer
+			_, err := h.WriteTo(&buf)
+			return buf.Bytes(), err
+		},
+	}
+	for name, output := range outputs {
+		t.Run(name, func(t *testing.T) {
+			data, err := output()
+			if err != nil {
+				t.Fatalf("%s() error: %v", name, err)
+			}
+			var entries []map[string]any
+			if err := json.Unmarshal(data, &entries); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			if len(entries) != 1 {
+				t.Fatalf("entries = %d, want 1", len(entries))
+			}
+			attrs, ok := entries[0]["attrs"].(map[string]any)
+			if !ok {
+				t.Fatalf("attrs type = %T, want map[string]any", entries[0]["attrs"])
+			}
+			checks := map[string]any{
+				"bool":                  true,
+				"duration":              float64((42 * time.Millisecond).Nanoseconds()),
+				"float64":               1.5,
+				"int64":                 float64(-42),
+				"string":                "value",
+				"time":                  wantTime.Format(time.RFC3339Nano),
+				"uint64":                float64(42),
+				"error":                 "plain error",
+				"logvaluer":             "REDACTED:secret",
+				"text_marshaling_error": "text:E_TEXT",
+			}
+			for key, want := range checks {
+				if got := attrs[key]; got != want {
+					t.Errorf("attrs[%q] = %#v, want %#v", key, got, want)
+				}
+			}
+			if got := attrs["any"].(map[string]any)["nested"]; got != "value" {
+				t.Errorf("attrs[any][nested] = %#v, want value", got)
+			}
+			if got := attrs["group"].(map[string]any)["child"]; got != "value" {
+				t.Errorf("attrs[group][child] = %#v, want value", got)
+			}
+			if got := attrs["marshaling_error"].(map[string]any)["code"]; got != "E_TEST" {
+				t.Errorf("attrs[marshaling_error][code] = %#v, want E_TEST", got)
+			}
+		})
+	}
+}
+
+func TestJSON_UnsupportedAnyReturnsError(t *testing.T) {
+	h := New(1, nil)
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "unsupported", 0)
+	r.AddAttrs(slog.Any("function", func() {}))
+	if err := h.Handle(t.Context(), r); err != nil {
+		t.Fatalf("Handle() error: %v", err)
+	}
+
+	if _, err := h.JSON(); err == nil {
+		t.Error("JSON() error = nil, want unsupported type error")
+	}
+	if _, err := h.WriteTo(io.Discard); err == nil {
+		t.Error("WriteTo() error = nil, want unsupported type error")
+	}
+}
+
+func TestJSON_TypedNilErrorIsNull(t *testing.T) {
+	var nilErr *nilMarshalingError
+	h := New(1, nil)
+	r := slog.NewRecord(time.Now(), slog.LevelInfo, "typed nil error", 0)
+	r.AddAttrs(slog.Any("error", nilErr))
+	if err := h.Handle(t.Context(), r); err != nil {
+		t.Fatalf("Handle() error: %v", err)
+	}
+
+	outputs := map[string]func() ([]byte, error){
+		"JSON": h.JSON,
+		"WriteTo": func() ([]byte, error) {
+			var buf bytes.Buffer
+			_, err := h.WriteTo(&buf)
+			return buf.Bytes(), err
+		},
+	}
+	for name, output := range outputs {
+		t.Run(name, func(t *testing.T) {
+			data, err := output()
+			if err != nil {
+				t.Fatalf("%s() error: %v", name, err)
+			}
+			var entries []map[string]any
+			if err := json.Unmarshal(data, &entries); err != nil {
+				t.Fatalf("Unmarshal: %v", err)
+			}
+			attrs := entries[0]["attrs"].(map[string]any)
+			got, ok := attrs["error"]
+			if !ok {
+				t.Fatal("typed nil error attribute is missing")
+			}
+			if got != nil {
+				t.Errorf("typed nil error = %#v, want null", got)
+			}
+		})
+	}
+}
+
 func TestClear(t *testing.T) {
 	h := New(10, nil)
 	logger := slog.New(h)
@@ -657,7 +820,7 @@ func TestHandle_EmptyKeyAttrWithNonComparableValue(t *testing.T) {
 	r := slog.NewRecord(time.Now(), slog.LevelInfo, "msg", 0)
 	r.AddAttrs(slog.Any("", []int{1, 2, 3}))          // empty key, non-comparable value → dropped
 	r.AddAttrs(slog.Group("", slog.String("c", "d"))) // inline group → kept
-	r.AddAttrs(slog.String("keep", "yes"))             // normal attr → kept
+	r.AddAttrs(slog.String("keep", "yes"))            // normal attr → kept
 	if err := h.Handle(ctx, r); err != nil {
 		t.Fatalf("Handle panicked or errored: %v", err)
 	}
@@ -800,8 +963,8 @@ func TestJSON_NestedGroups(t *testing.T) {
 type collectingHandler struct {
 	mu         sync.Mutex
 	recs       []slog.Record
-	err        error      // if non-nil, Handle returns this error
-	handleFunc func()     // optional hook called inside Handle (outside mu)
+	err        error  // if non-nil, Handle returns this error
+	handleFunc func() // optional hook called inside Handle (outside mu)
 }
 
 func (ch *collectingHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -1387,23 +1550,19 @@ func TestFlush_ConcurrentWithHandle(t *testing.T) {
 	var wg sync.WaitGroup
 	// Writers
 	for range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 100 {
 				logger.Info("msg")
 			}
-		}()
+		})
 	}
 	// Flushers
 	for range 2 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 10 {
 				_ = h.Flush(t.Context())
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	// No race detector failures is the success criterion.
@@ -1808,9 +1967,8 @@ func TestWriteTo_OutputIsValidJSONArray(t *testing.T) {
 		t.Errorf("got %d entries, want 2", len(entries))
 	}
 
-	// Output must not have trailing whitespace — ensures both build paths
-	// (standard json.Marshal and streaming jsontext.Encoder) produce
-	// byte-compatible output.
+	// WriteTo deliberately omits the top-level newline added by jsontext.Encoder.
+	// This is a formatting guarantee, not byte compatibility between JSON modes.
 	if len(raw) != len(trimmed) {
 		t.Errorf("WriteTo has %d trailing whitespace byte(s): %q",
 			len(raw)-len(trimmed), raw[len(trimmed):])

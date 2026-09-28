@@ -1,18 +1,26 @@
 [tools]
-go = "1.26"
-act = "latest"
+go = "1.27"
+act = "0.2.89"
 
 [tasks.test]
 run = "go test -v -race ./..."
 description = "Run all tests with race detector"
 
 [tasks.bench]
-run = "go test -bench=. -benchmem -count=10 ./..."
-description = "Run benchmarks"
+run = "go test -run=^$ -bench=. -benchmem -count=10 ./..."
+description = "Run benchmarks with the default JSON v2 implementation"
 
 [tasks.lint]
 run = "go vet ./..."
 description = "Run go vet"
+
+[tasks.test-v1]
+run = "GOEXPERIMENT=nojsonv2 go test -v -race ./..."
+description = "Run all tests with the JSON v1 fallback"
+
+[tasks.lint-v1]
+run = "GOEXPERIMENT=nojsonv2 go vet ./..."
+description = "Run go vet with the JSON v1 fallback"
 
 [tasks.ci]
 run = "act -W .github/workflows/ci.yml"

@@ -15,9 +15,9 @@ package slogbox
 
 import (
 	"context"
-	"encoding/json"
 	"iter"
 	"log/slog"
+	"reflect"
 	"slices"
 	"time"
 )
@@ -354,12 +354,6 @@ type jsonEntry struct {
 	Attrs   map[string]any `json:"attrs,omitzero"`
 }
 
-// JSON returns the buffered records as a JSON array suitable for HTTP responses.
-// If MaxAge is set, records older than MaxAge are excluded.
-func (h *Handler) JSON() ([]byte, error) {
-	return json.Marshal(recordsToEntries(h.Records()))
-}
-
 func recordsToEntries(records []slog.Record) []jsonEntry {
 	entries := make([]jsonEntry, len(records))
 	for i, r := range records {
@@ -478,6 +472,49 @@ func addAttrToMap(m map[string]any, a slog.Attr) {
 		}
 		m[a.Key] = gm
 	} else {
-		m[a.Key] = v.Any()
+		m[a.Key] = jsonValue(v)
 	}
+}
+
+// jsonValue converts slog's native kinds to their documented underlying values
+// before handing arbitrary KindAny values to the selected JSON implementation.
+// In particular, JSON v2 deliberately has no default representation for
+// time.Duration, while slog represents durations as nanoseconds in JSON.
+func jsonValue(v slog.Value) any {
+	switch v.Kind() {
+	case slog.KindAny:
+		return normalizeAny(v.Any())
+	case slog.KindBool:
+		return v.Bool()
+	case slog.KindDuration:
+		return v.Duration().Nanoseconds()
+	case slog.KindFloat64:
+		return v.Float64()
+	case slog.KindInt64:
+		return v.Int64()
+	case slog.KindString:
+		return v.String()
+	case slog.KindTime:
+		return v.Time()
+	case slog.KindUint64:
+		return v.Uint64()
+	case slog.KindGroup:
+		m := make(map[string]any)
+		for _, a := range v.Group() {
+			addAttrToMap(m, a)
+		}
+		return m
+	case slog.KindLogValuer:
+		return jsonValue(v.Resolve())
+	default:
+		return normalizeAny(v.Any())
+	}
+}
+
+// isNilPointer reports whether v contains a nil pointer. A non-nil interface
+// can contain a nil pointer, so comparing the interface itself with nil is
+// insufficient.
+func isNilPointer(v any) bool {
+	rv := reflect.ValueOf(v)
+	return rv.IsValid() && rv.Kind() == reflect.Pointer && rv.IsNil()
 }
