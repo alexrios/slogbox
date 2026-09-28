@@ -256,10 +256,13 @@ For the comparison below, each mode was sampled ten times with Go 1.27.0 on an
 Intel Core i9-14900K. Runs alternated between v1 and v2, were pinned to the same
 P-core, used `GOMAXPROCS=1`, and ran for one second per sub-benchmark. `benchstat`
 computed the medians, 95% confidence intervals, and Mann-Whitney U significance
-test at alpha 0.05. The checked-in script reproduces this procedure:
+test at alpha 0.05.
+
+Run the JSON benchmarks for each mode directly:
 
 ```bash
-BENCH_CPU=8 scripts/compare-json-benchmarks.sh
+GOEXPERIMENT=jsonv2 go test -run='^$' -bench='^Benchmark(JSON|WriteTo)$' -benchmem -count=10 ./...
+GOEXPERIMENT=nojsonv2 go test -run='^$' -bench='^Benchmark(JSON|WriteTo)$' -benchmem -count=10 ./...
 ```
 
 ### JSON v2 compared with the JSON v1 fallback

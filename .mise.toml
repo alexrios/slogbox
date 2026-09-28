@@ -1,7 +1,6 @@
 [tools]
 go = "1.27"
 act = "0.2.89"
-"go:golang.org/x/perf/cmd/benchstat" = "v0.0.0-20260819171926-ebcb4798430d"
 
 [tasks.test]
 run = "go test -v -race ./..."
